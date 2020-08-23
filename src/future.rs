@@ -15,32 +15,31 @@
 //! # });
 //! ```
 
-// TODO: race!, try_race(), try_race! (randomized for fairness)
-// TODO: join!, try_join!
-
 use core::fmt;
 #[doc(no_inline)]
 pub use core::future::Future;
-use core::marker::PhantomData;
 use core::pin::Pin;
+use core::task::{Context, Poll};
 
+pub use futures_micro::{
+    or, pending, poll_fn, poll_state, sleep, waker, zip,
+    Or, PollFn, PollState, Ready, Zip
+};
 use pin_project_lite::pin_project;
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
-use core::task::{Context, Poll};
 
 #[cfg(feature = "std")]
 use parking::Parker;
 #[cfg(feature = "std")]
 use waker_fn::waker_fn;
 #[cfg(feature = "std")]
-use core::task::{Context, Poll, Waker};
+use std::task::Waker;
 #[cfg(feature = "std")]
-use core::cell::RefCell;
+use std::cell::RefCell;
 
 #[cfg(feature = "std")]
 use crate::pin;
@@ -112,46 +111,6 @@ pub fn block_on<T>(future: impl Future<Output = T>) -> T {
     })
 }
 
-/// Creates a future that is always pending.
-///
-/// # Examples
-///
-/// ```no_run
-/// use futures_lite::*;
-///
-/// # future::block_on(async {
-/// future::pending::<()>().await;
-/// unreachable!();
-/// # })
-/// ```
-pub fn pending<T>() -> Pending<T> {
-    Pending {
-        _marker: PhantomData,
-    }
-}
-
-/// Future for the [`pending()`] function.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Pending<T> {
-    _marker: PhantomData<T>,
-}
-
-impl<T> Unpin for Pending<T> {}
-
-impl<T> fmt::Debug for Pending<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Pending").finish()
-    }
-}
-
-impl<T> Future for Pending<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<T> {
-        Poll::Pending
-    }
-}
-
 /// Polls a future just once and returns an [`Option`] with the result.
 ///
 /// # Examples
@@ -201,7 +160,7 @@ where
     }
 }
 
-/// Creates a future from a function returning [`Poll`].
+/// Creates a future that resolves to the provided value.
 ///
 /// # Examples
 ///
@@ -210,74 +169,16 @@ where
 /// use std::task::{Context, Poll};
 ///
 /// # future::block_on(async {
-/// fn f(_: &mut Context<'_>) -> Poll<i32> {
+/// assert_eq!(future::ready(7).await, 7);
+/// fn f(state: &mut i32, _ctx: &mut Context<'_>) -> Poll<i32> {
 ///     Poll::Ready(7)
 /// }
 ///
-/// assert_eq!(future::poll_fn(f).await, 7);
-/// # })
-/// ```
-pub fn poll_fn<T, F>(f: F) -> PollFn<F>
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T>,
-{
-    PollFn { f }
-}
-
-pin_project! {
-    /// Future for the [`poll_fn()`] function.
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct PollFn<F> {
-        f: F,
-    }
-}
-
-impl<F> fmt::Debug for PollFn<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PollFn").finish()
-    }
-}
-
-impl<T, F> Future for PollFn<F>
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T>,
-{
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        let this = self.project();
-        (this.f)(cx)
-    }
-}
-
-/// Creates a future that resolves to the provided value.
-///
-/// # Examples
-///
-/// ```
-/// use futures_lite::*;
-///
-/// # future::block_on(async {
-/// assert_eq!(future::ready(7).await, 7);
+/// assert_eq!(future::poll_state(7, f).await, 7);
 /// # })
 /// ```
 pub fn ready<T>(val: T) -> Ready<T> {
-    Ready(Some(val))
-}
-
-/// Future for the [`ready()`] function.
-#[derive(Debug)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Ready<T>(Option<T>);
-
-impl<T> Unpin for Ready<T> {}
-
-impl<T> Future for Ready<T> {
-    type Output = T;
-
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
-        Poll::Ready(self.0.take().expect("`Ready` polled after completion"))
-    }
+    Ready::new(val)
 }
 
 /// Wakes the current task and returns [`Poll::Pending`] once.
@@ -318,7 +219,7 @@ impl Future for YieldNow {
     }
 }
 
-/// Joins two futures, waiting for both to complete.
+/// Zips two futures, waiting for both to complete.
 ///
 /// # Examples
 ///
@@ -329,71 +230,18 @@ impl Future for YieldNow {
 /// let a = async { 1 };
 /// let b = async { 2 };
 ///
-/// assert_eq!(future::join(a, b).await, (1, 2));
+/// assert_eq!(future::zip(a, b).await, (1, 2));
 /// # })
 /// ```
-pub fn join<F1, F2>(future1: F1, future2: F2) -> Join<F1, F2>
+pub fn zip<F1, F2>(future1: F1, future2: F2) -> Zip<F1, F2>
 where
     F1: Future,
     F2: Future,
 {
-    Join {
-        future1: future1,
-        output1: None,
-        future2: future2,
-        output2: None,
-    }
+    Zip::new(future1, future2)
 }
 
-pin_project! {
-    /// Future for the [`join()`] function.
-    #[derive(Debug)]
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct Join<F1, F2>
-    where
-        F1: Future,
-        F2: Future,
-    {
-        #[pin]
-        future1: F1,
-        output1: Option<F1::Output>,
-        #[pin]
-        future2: F2,
-        output2: Option<F2::Output>,
-    }
-}
-
-impl<F1, F2> Future for Join<F1, F2>
-where
-    F1: Future,
-    F2: Future,
-{
-    type Output = (F1::Output, F2::Output);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        if this.output1.is_none() {
-            if let Poll::Ready(out) = this.future1.poll(cx) {
-                *this.output1 = Some(out);
-            }
-        }
-
-        if this.output2.is_none() {
-            if let Poll::Ready(out) = this.future2.poll(cx) {
-                *this.output2 = Some(out);
-            }
-        }
-
-        if this.output1.is_some() && this.output2.is_some() {
-            Poll::Ready((this.output1.take().unwrap(), this.output2.take().unwrap()))
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-/// Joins two fallible futures, waiting for both to complete or one of them to error.
+/// Zips two fallible futures, waiting for both to complete or one of them to error.
 ///
 /// # Examples
 ///
@@ -404,15 +252,15 @@ where
 /// let a = async { Ok::<i32, i32>(1) };
 /// let b = async { Err::<i32, i32>(2) };
 ///
-/// assert_eq!(future::try_join(a, b).await, Err(2));
+/// assert_eq!(future::try_zip(a, b).await, Err(2));
 /// # })
 /// ```
-pub fn try_join<T1, T2, E, F1, F2>(future1: F1, future2: F2) -> TryJoin<F1, F2>
+pub fn try_zip<T1, T2, E, F1, F2>(future1: F1, future2: F2) -> TryZip<F1, F2>
 where
     F1: Future<Output = Result<T1, E>>,
     F2: Future<Output = Result<T2, E>>,
 {
-    TryJoin {
+    TryZip {
         future1: future1,
         output1: None,
         future2: future2,
@@ -421,10 +269,10 @@ where
 }
 
 pin_project! {
-    /// Future for the [`try_join()`] function.
+    /// Future for the [`try_zip()`] function.
     #[derive(Debug)]
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct TryJoin<F1, F2>
+    pub struct TryZip<F1, F2>
     where
         F1: Future,
         F2: Future,
@@ -438,7 +286,7 @@ pin_project! {
     }
 }
 
-impl<T1, T2, E, F1, F2> Future for TryJoin<F1, F2>
+impl<T1, T2, E, F1, F2> Future for TryZip<F1, F2>
 where
     F1: Future<Output = Result<T1, E>>,
     F2: Future<Output = Result<T2, E>>,
@@ -600,10 +448,7 @@ pub trait FutureExt: Future {
         Self: Sized,
         F: Future<Output = Self::Output>,
     {
-        Or {
-            future1: self,
-            future2: other,
-        }
+        Or::new(self, other)
     }
 
     /// Boxes the future and changes its type to `dyn Future<Output = T> + Send`.
@@ -654,35 +499,3 @@ pub trait FutureExt: Future {
 }
 
 impl<F: ?Sized> FutureExt for F where F: Future {}
-
-pin_project! {
-    /// Future for the [`or()`][`FutureExt::or()`] method.
-    #[derive(Debug)]
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct Or<F1, F2> {
-        #[pin]
-        future1: F1,
-        #[pin]
-        future2: F2,
-    }
-}
-
-impl<T, F1, F2> Future for Or<F1, F2>
-where
-    F1: Future<Output = T>,
-    F2: Future<Output = T>,
-{
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        if let Poll::Ready(t) = this.future1.poll(cx) {
-            return Poll::Ready(t);
-        }
-        if let Poll::Ready(t) = this.future2.poll(cx) {
-            return Poll::Ready(t);
-        }
-        Poll::Pending
-    }
-}
