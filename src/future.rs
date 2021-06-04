@@ -606,6 +606,69 @@ where
     }
 }
 
+pin_project! {
+    /// Future for the [`FutureExt::map()`] method.
+    #[derive(Debug)]
+    #[must_use = "futures do nothing unless you .await or poll them"]
+    pub struct Map<Fut, F> {
+        #[pin]
+        inner: Fut,
+        map_function: Option<F>,
+    }
+}
+
+impl<Fut: Future, Out, F: FnOnce(Fut::Output) -> Out + Unpin> Future for Map<Fut, F> {
+    type Output = Out;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Out> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(input) => 
+                Poll::Ready((this.map_function.take().expect("Future polled past completion"))(input)),
+        }
+    }
+}
+
+pin_project! {
+    /// Future for the [`FutureExt::chain()`] method.
+    #[derive(Debug)]
+    #[must_use = "futures do nothing unless you .await or poll them"]
+    pub struct Chain<Fut1, Fut2, F> {
+        #[pin]
+        fut1: Option<Fut1>,
+        #[pin]
+        fut2: Option<Fut2>,
+        map_function: Option<F>,
+    }
+}
+
+impl<Fut1: Future, Fut2: Future, F: FnOnce(Fut1::Output) -> Fut2 + Unpin> Future for Chain<Fut1, Fut2, F> {
+    type Output = Fut2::Output;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut2::Output> {
+        let mut this = self.project();
+
+        if let Some(fut1) = this.fut1.as_mut().as_pin_mut() {
+            match fut1.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(output1) => {
+                    this.fut1.set(None);
+                    let map_function = this.map_function.take().expect("Not physically possible");
+                    this.fut2.set(Some(map_function(output1)));
+                }
+            }
+        }
+
+        match this.fut2.as_pin_mut() {
+            Some(fut2) => fut2.poll(cx),
+            None => unreachable!("Cannot poll an empty hole"),
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 pin_project! {
     /// Future for the [`FutureExt::catch_unwind()`] method.
@@ -725,6 +788,36 @@ pub trait FutureExt: Future {
             future1: self,
             future2: other,
         }
+    }
+
+    /// Map the result of a `Future` using a function.
+    /// 
+    /// # Examples
+    ///
+    /// ```
+    /// use futures_lite::future::{ready, FutureExt};
+    ///
+    /// # spin_on::spin_on(async {
+    /// assert_eq!(ready(1).map(|i| i + 1).await, 2);
+    /// # })
+    /// ```
+    fn map<F>(self, map_function: F) -> Map<Self, F> where Self: Sized {
+        Map { inner: self, map_function: Some(map_function) }
+    }
+
+    /// Chain two `Future`s together so that the output of one is fed into another.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use futures_lite::future::{ready, FutureExt};
+    /// 
+    /// # spin_on::spin_on(async {
+    /// assert_eq!(ready(1).chain(|i| async move { i + 3 }).await, 4);
+    /// # })
+    /// ```
+    fn chain<Other, F>(self, map_function: F) -> Chain<Self, Other, F> where Self: Sized, F: FnOnce(Self::Output) -> Other {
+        Chain { fut1: Some(self), fut2: None, map_function: Some(map_function) }
     }
 
     /// Catches panics while polling the future.
